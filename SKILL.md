@@ -1,12 +1,12 @@
 ---
 name: clawra-selfie
-description: Edit Clawra's reference image with Grok Imagine (xAI Aurora) and send selfies to messaging channels via OpenClaw
+description: Edit Clawra's reference image with Grok Imagine via OpenAI-compatible Chat Completions and send selfies via OpenClaw
 allowed-tools: Bash(npm:*) Bash(npx:*) Bash(openclaw:*) Bash(curl:*) Read Write WebFetch
 ---
 
 # Clawra Selfie
 
-Edit a fixed reference image using xAI's Grok Imagine model and distribute it across messaging platforms (WhatsApp, Telegram, Discord, Slack, etc.) via OpenClaw.
+Edit a fixed reference image using an **OpenAI-compatible** `/v1/chat/completions` API (assistant `content` = image URL), then send results across messaging platforms (WhatsApp, Telegram, Discord, Slack, etc.) via OpenClaw.
 
 ## Reference Image
 
@@ -15,6 +15,8 @@ The skill uses a fixed reference image hosted on jsDelivr CDN:
 ```
 https://cdn.jsdelivr.net/gh/SumeLabs/clawra@main/assets/clawra.png
 ```
+
+Override with `CLAWRA_REFERENCE_IMAGE_URL` if needed.
 
 ## When to Use
 
@@ -26,18 +28,23 @@ https://cdn.jsdelivr.net/gh/SumeLabs/clawra@main/assets/clawra.png
 
 ## Quick Reference
 
-### Required Environment Variables
+### Environment Variables
 
 ```bash
-FAL_KEY=your_fal_api_key          # Get from https://fal.ai/dashboard/keys
-OPENCLAW_GATEWAY_TOKEN=your_token  # From: openclaw doctor --generate-gateway-token
+CLAWRA_API_KEY=your_bearer_token       # Required (Authorization: Bearer)
+CLAWRA_API_BASE_URL=https://api.2slk.com/v1   # Optional; no trailing slash
+CLAWRA_MODEL_EDIT=grok-imagine-1.0-edit     # Optional
+CLAWRA_MODEL_GENERATE=grok-imagine-1.0      # Optional (text-to-image only)
+CLAWRA_TEMPERATURE=0.7                 # Optional
+CLAWRA_REFERENCE_IMAGE_URL=...         # Optional; defaults to CDN URL above
+OPENCLAW_GATEWAY_TOKEN=your_token      # From: openclaw doctor --generate-gateway-token
 ```
 
 ### Workflow
 
 1. **Get user prompt** for how to edit the image
-2. **Edit image** via fal.ai Grok Imagine Edit API with fixed reference
-3. **Extract image URL** from response
+2. **Call Chat Completions** with multimodal user message (text + reference `image_url`) and **edit** model
+3. **Parse image URL** from `choices[0].message.content`
 4. **Send to OpenClaw** with target channel(s)
 
 ## Step-by-Step Instructions
@@ -85,12 +92,13 @@ a close-up selfie taken by herself at a cozy cafe with warm lighting, direct eye
 | close-up, portrait, face, eyes, smile | `direct` |
 | full-body, mirror, reflection | `mirror` |
 
-### Step 2: Edit Image with Grok Imagine
-
-Use the fal.ai API to edit the reference image:
+### Step 2: Edit Image (Chat Completions)
 
 ```bash
-REFERENCE_IMAGE="https://cdn.jsdelivr.net/gh/SumeLabs/clawra@main/assets/clawra.png"
+API_BASE="${CLAWRA_API_BASE_URL:-https://api.2slk.com/v1}"
+API_BASE="${API_BASE%/}"
+MODEL="${CLAWRA_MODEL_EDIT:-grok-imagine-1.0-edit}"
+REFERENCE_IMAGE="${CLAWRA_REFERENCE_IMAGE_URL:-https://cdn.jsdelivr.net/gh/SumeLabs/clawra@main/assets/clawra.png}"
 
 # Mode 1: Mirror Selfie
 PROMPT="make a pic of this person, but <USER_CONTEXT>. the person is taking a mirror selfie"
@@ -98,36 +106,47 @@ PROMPT="make a pic of this person, but <USER_CONTEXT>. the person is taking a mi
 # Mode 2: Direct Selfie
 PROMPT="a close-up selfie taken by herself at <USER_CONTEXT>, direct eye contact with the camera, looking straight into the lens, eyes centered and clearly visible, not a mirror selfie, phone held at arm's length, face fully visible"
 
-# Build JSON payload with jq (handles escaping properly)
-JSON_PAYLOAD=$(jq -n \
-  --arg image_url "$REFERENCE_IMAGE" \
-  --arg prompt "$PROMPT" \
-  '{image_url: $image_url, prompt: $prompt, num_images: 1, output_format: "jpeg"}')
+REQUEST_BODY=$(jq -n \
+  --arg model "$MODEL" \
+  --arg text "$PROMPT" \
+  --arg url "$REFERENCE_IMAGE" \
+  --arg temp "${CLAWRA_TEMPERATURE:-0.7}" \
+  '{
+    model: $model,
+    messages: [{
+      role: "user",
+      content: [
+        {type: "text", text: $text},
+        {type: "image_url", image_url: {url: $url}}
+      ]
+    }],
+    temperature: ($temp | tonumber)
+  }')
 
-curl -X POST "https://fal.run/xai/grok-imagine-image/edit" \
-  -H "Authorization: Key $FAL_KEY" \
+curl -s -X POST "${API_BASE}/chat/completions" \
+  -H "Authorization: Bearer ${CLAWRA_API_KEY}" \
   -H "Content-Type: application/json" \
-  -d "$JSON_PAYLOAD"
+  -d "$REQUEST_BODY"
 ```
 
-**Response Format:**
+**Response (shape):** assistant text is the image URL:
+
 ```json
 {
-  "images": [
+  "choices": [
     {
-      "url": "https://v3b.fal.media/files/...",
-      "content_type": "image/jpeg",
-      "width": 1024,
-      "height": 1024
+      "message": {
+        "role": "assistant",
+        "content": "https://example.com/generated/image.jpg"
+      }
     }
-  ],
-  "revised_prompt": "Enhanced prompt text..."
+  ]
 }
 ```
 
-### Step 3: Send Image via OpenClaw
+Extract: `jq -r '.choices[0].message.content'`
 
-Use the OpenClaw messaging API to send the edited image:
+### Step 3: Send Image via OpenClaw
 
 ```bash
 openclaw message send \
@@ -138,6 +157,7 @@ openclaw message send \
 ```
 
 **Alternative: Direct API call**
+
 ```bash
 curl -X POST "http://localhost:18789/message" \
   -H "Authorization: Bearer $OPENCLAW_GATEWAY_TOKEN" \
@@ -150,80 +170,88 @@ curl -X POST "http://localhost:18789/message" \
   }'
 ```
 
-## Complete Script Example
+## Complete Script Example (edit + send)
 
 ```bash
 #!/bin/bash
-# grok-imagine-edit-send.sh
+set -euo pipefail
 
-# Check required environment variables
-if [ -z "$FAL_KEY" ]; then
-  echo "Error: FAL_KEY environment variable not set"
+if [ -z "${CLAWRA_API_KEY:-}" ]; then
+  echo "Error: CLAWRA_API_KEY not set"
   exit 1
 fi
 
-# Fixed reference image
-REFERENCE_IMAGE="https://cdn.jsdelivr.net/gh/SumeLabs/clawra@main/assets/clawra.png"
+API_BASE="${CLAWRA_API_BASE_URL:-https://api.2slk.com/v1}"
+API_BASE="${API_BASE%/}"
+MODEL="${CLAWRA_MODEL_EDIT:-grok-imagine-1.0-edit}"
+REFERENCE_IMAGE="${CLAWRA_REFERENCE_IMAGE_URL:-https://cdn.jsdelivr.net/gh/SumeLabs/clawra@main/assets/clawra.png}"
 
 USER_CONTEXT="$1"
 CHANNEL="$2"
-MODE="${3:-auto}"  # mirror, direct, or auto
+MODE="${3:-auto}"
 CAPTION="${4:-Edited with Grok Imagine}"
 
 if [ -z "$USER_CONTEXT" ] || [ -z "$CHANNEL" ]; then
   echo "Usage: $0 <user_context> <channel> [mode] [caption]"
-  echo "Modes: mirror, direct, auto (default)"
-  echo "Example: $0 'wearing a cowboy hat' '#general' mirror"
-  echo "Example: $0 'a cozy cafe' '#general' direct"
   exit 1
 fi
 
-# Auto-detect mode based on keywords
 if [ "$MODE" == "auto" ]; then
   if echo "$USER_CONTEXT" | grep -qiE "outfit|wearing|clothes|dress|suit|fashion|full-body|mirror"; then
     MODE="mirror"
   elif echo "$USER_CONTEXT" | grep -qiE "cafe|restaurant|beach|park|city|close-up|portrait|face|eyes|smile"; then
     MODE="direct"
   else
-    MODE="mirror"  # default
+    MODE="mirror"
   fi
   echo "Auto-detected mode: $MODE"
 fi
 
-# Construct the prompt based on mode
 if [ "$MODE" == "direct" ]; then
   EDIT_PROMPT="a close-up selfie taken by herself at $USER_CONTEXT, direct eye contact with the camera, looking straight into the lens, eyes centered and clearly visible, not a mirror selfie, phone held at arm's length, face fully visible"
 else
   EDIT_PROMPT="make a pic of this person, but $USER_CONTEXT. the person is taking a mirror selfie"
 fi
 
-echo "Mode: $MODE"
-echo "Editing reference image with prompt: $EDIT_PROMPT"
+REQUEST_BODY=$(jq -n \
+  --arg model "$MODEL" \
+  --arg text "$EDIT_PROMPT" \
+  --arg url "$REFERENCE_IMAGE" \
+  --arg temp "${CLAWRA_TEMPERATURE:-0.7}" \
+  '{
+    model: $model,
+    messages: [{
+      role: "user",
+      content: [
+        {type: "text", text: $text},
+        {type: "image_url", image_url: {url: $url}}
+      ]
+    }],
+    temperature: ($temp | tonumber)
+  }')
 
-# Edit image (using jq for proper JSON escaping)
-JSON_PAYLOAD=$(jq -n \
-  --arg image_url "$REFERENCE_IMAGE" \
-  --arg prompt "$EDIT_PROMPT" \
-  '{image_url: $image_url, prompt: $prompt, num_images: 1, output_format: "jpeg"}')
-
-RESPONSE=$(curl -s -X POST "https://fal.run/xai/grok-imagine-image/edit" \
-  -H "Authorization: Key $FAL_KEY" \
+RESPONSE=$(curl -s -X POST "${API_BASE}/chat/completions" \
+  -H "Authorization: Bearer ${CLAWRA_API_KEY}" \
   -H "Content-Type: application/json" \
-  -d "$JSON_PAYLOAD")
+  -d "$REQUEST_BODY")
 
-# Extract image URL
-IMAGE_URL=$(echo "$RESPONSE" | jq -r '.images[0].url')
-
-if [ "$IMAGE_URL" == "null" ] || [ -z "$IMAGE_URL" ]; then
-  echo "Error: Failed to edit image"
-  echo "Response: $RESPONSE"
+if echo "$RESPONSE" | jq -e '.error' > /dev/null 2>&1; then
+  echo "Error: $(echo "$RESPONSE" | jq -r '.error.message // .error')"
   exit 1
 fi
 
-echo "Image edited: $IMAGE_URL"
-echo "Sending to channel: $CHANNEL"
+RAW=$(echo "$RESPONSE" | jq -r '.choices[0].message.content // empty')
+IMAGE_URL=$(echo "$RAW" | awk 'NF {print $1; exit}' | sed 's/[.,;:)]*$//')
+if [[ ! "$IMAGE_URL" =~ ^https?:// ]]; then
+  IMAGE_URL=$(echo "$RAW" | grep -oE 'https?://[^[:space:]"'\''<>)]+' | head -1)
+fi
 
-# Send via OpenClaw
+if [ -z "$IMAGE_URL" ]; then
+  echo "Error: no image URL in response"
+  echo "$RESPONSE"
+  exit 1
+fi
+
 openclaw message send \
   --action send \
   --channel "$CHANNEL" \
@@ -233,113 +261,31 @@ openclaw message send \
 echo "Done!"
 ```
 
-## Node.js/TypeScript Implementation
+## TypeScript (scripts/clawra-selfie.ts)
+
+Use the bundled module — **no fal client**:
 
 ```typescript
-import { fal } from "@fal-ai/client";
-import { exec } from "child_process";
-import { promisify } from "util";
+import {
+  editAndSend,
+  generateAndSend,
+} from "./clawra-selfie";
 
-const execAsync = promisify(exec);
+// Primary flow: edit reference + OpenClaw send
+await editAndSend({
+  prompt: "make a pic of this person, but wearing a santa hat. the person is taking a mirror selfie",
+  channel: "#general",
+  caption: "Holiday vibes!",
+});
 
-const REFERENCE_IMAGE = "https://cdn.jsdelivr.net/gh/SumeLabs/clawra@main/assets/clawra.png";
-
-interface GrokImagineResult {
-  images: Array<{
-    url: string;
-    content_type: string;
-    width: number;
-    height: number;
-  }>;
-  revised_prompt?: string;
-}
-
-type SelfieMode = "mirror" | "direct" | "auto";
-
-function detectMode(userContext: string): "mirror" | "direct" {
-  const mirrorKeywords = /outfit|wearing|clothes|dress|suit|fashion|full-body|mirror/i;
-  const directKeywords = /cafe|restaurant|beach|park|city|close-up|portrait|face|eyes|smile/i;
-
-  if (directKeywords.test(userContext)) return "direct";
-  if (mirrorKeywords.test(userContext)) return "mirror";
-  return "mirror"; // default
-}
-
-function buildPrompt(userContext: string, mode: "mirror" | "direct"): string {
-  if (mode === "direct") {
-    return `a close-up selfie taken by herself at ${userContext}, direct eye contact with the camera, looking straight into the lens, eyes centered and clearly visible, not a mirror selfie, phone held at arm's length, face fully visible`;
-  }
-  return `make a pic of this person, but ${userContext}. the person is taking a mirror selfie`;
-}
-
-async function editAndSend(
-  userContext: string,
-  channel: string,
-  mode: SelfieMode = "auto",
-  caption?: string
-): Promise<string> {
-  // Configure fal.ai client
-  fal.config({
-    credentials: process.env.FAL_KEY!
-  });
-
-  // Determine mode
-  const actualMode = mode === "auto" ? detectMode(userContext) : mode;
-  console.log(`Mode: ${actualMode}`);
-
-  // Construct the prompt
-  const editPrompt = buildPrompt(userContext, actualMode);
-
-  // Edit reference image with Grok Imagine
-  console.log(`Editing image: "${editPrompt}"`);
-
-  const result = await fal.subscribe("xai/grok-imagine-image/edit", {
-    input: {
-      image_url: REFERENCE_IMAGE,
-      prompt: editPrompt,
-      num_images: 1,
-      output_format: "jpeg"
-    }
-  }) as { data: GrokImagineResult };
-
-  const imageUrl = result.data.images[0].url;
-  console.log(`Edited image URL: ${imageUrl}`);
-
-  // Send via OpenClaw
-  const messageCaption = caption || `Edited with Grok Imagine`;
-
-  await execAsync(
-    `openclaw message send --action send --channel "${channel}" --message "${messageCaption}" --media "${imageUrl}"`
-  );
-
-  console.log(`Sent to ${channel}`);
-  return imageUrl;
-}
-
-// Usage Examples
-
-// Mirror mode (auto-detected from "wearing")
-editAndSend(
-  "wearing a cyberpunk outfit with neon lights",
-  "#art-gallery",
-  "auto",
-  "Check out this AI-edited art!"
-);
-// → Mode: mirror
-// → Prompt: "make a pic of this person, but wearing a cyberpunk outfit with neon lights. the person is taking a mirror selfie"
-
-// Direct mode (auto-detected from "cafe")
-editAndSend(
-  "a cozy cafe with warm lighting",
-  "#photography",
-  "auto"
-);
-// → Mode: direct
-// → Prompt: "a close-up selfie taken by herself at a cozy cafe with warm lighting, direct eye contact..."
-
-// Explicit mode override
-editAndSend("casual street style", "#fashion", "direct");
+// Text-to-image only (generate model)
+await generateAndSend({
+  prompt: "A futuristic city skyline at night",
+  channel: "#art",
+});
 ```
+
+CLI: set `CLAWRA_SELFIE_MODE=edit` to run edit mode from the command line.
 
 ## Supported Platforms
 
@@ -354,59 +300,49 @@ OpenClaw supports sending to:
 | Signal | Phone number | `+1234567890` |
 | MS Teams | Channel reference | (varies) |
 
-## Grok Imagine Edit Parameters
+## API Notes
 
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `image_url` | string | required | URL of image to edit (fixed in this skill) |
-| `prompt` | string | required | Edit instruction |
-| `num_images` | 1-4 | 1 | Number of images to generate |
-| `output_format` | enum | "jpeg" | jpeg, png, webp |
+| Topic | Notes |
+|-------|--------|
+| Endpoint | `POST {CLAWRA_API_BASE_URL}/chat/completions` |
+| Auth | `Authorization: Bearer <CLAWRA_API_KEY>` |
+| Edit | Multimodal `user` message: `text` + `image_url` |
+| Generate | Single string `user` content + generate model |
+| Output | Image URL in `choices[0].message.content` (plain URL or extractable from text) |
+
+Aspect ratio, output format, and multi-image counts are **not** part of the standard chat body; only add them if your provider documents extra JSON fields.
 
 ## Setup Requirements
 
-### 1. Install fal.ai client (for Node.js usage)
-```bash
-npm install @fal-ai/client
-```
+### 1. OpenClaw CLI
 
-### 2. Install OpenClaw CLI
 ```bash
 npm install -g openclaw
 ```
 
-### 3. Configure OpenClaw Gateway
+### 2. Configure OpenClaw Gateway
+
 ```bash
 openclaw config set gateway.mode=local
 openclaw doctor --generate-gateway-token
 ```
 
-### 4. Start OpenClaw Gateway
+### 3. Start OpenClaw Gateway
+
 ```bash
 openclaw gateway start
 ```
 
 ## Error Handling
 
-- **FAL_KEY missing**: Ensure the API key is set in environment
-- **Image edit failed**: Check prompt content and API quota
+- **CLAWRA_API_KEY missing**: Set in skill `env` in `openclaw.json`
+- **HTTP 4xx/5xx**: Read `error.message` from JSON body when present
+- **No URL in content**: Model may have returned prose; widen prompt or log full `content`
 - **OpenClaw send failed**: Verify gateway is running and channel exists
-- **Rate limits**: fal.ai has rate limits; implement retry logic if needed
 
 ## Tips
 
-1. **Mirror mode context examples** (outfit focus):
-   - "wearing a santa hat"
-   - "in a business suit"
-   - "wearing a summer dress"
-   - "in streetwear fashion"
-
-2. **Direct mode context examples** (location/portrait focus):
-   - "a cozy cafe with warm lighting"
-   - "a sunny beach at sunset"
-   - "a busy city street at night"
-   - "a peaceful park in autumn"
-
-3. **Mode selection**: Let auto-detect work, or explicitly specify for control
-4. **Batch sending**: Edit once, send to multiple channels
-5. **Scheduling**: Combine with OpenClaw scheduler for automated posts
+1. **Mirror mode** examples: "wearing a santa hat", "in a business suit", "streetwear"
+2. **Direct mode** examples: "cozy cafe", "beach at sunset", "city at night"
+3. **Batch sending**: Edit once, send to multiple channels
+4. **Scheduling**: Combine with OpenClaw scheduler for automated posts

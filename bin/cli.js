@@ -9,7 +9,7 @@
 const fs = require("fs");
 const path = require("path");
 const readline = require("readline");
-const { execSync, spawn } = require("child_process");
+const { execSync } = require("child_process");
 const os = require("os");
 
 // Colors for terminal output
@@ -92,27 +92,6 @@ function commandExists(cmd) {
   }
 }
 
-// Open URL in browser
-function openBrowser(url) {
-  const platform = process.platform;
-  let cmd;
-
-  if (platform === "darwin") {
-    cmd = `open "${url}"`;
-  } else if (platform === "win32") {
-    cmd = `start "${url}"`;
-  } else {
-    cmd = `xdg-open "${url}"`;
-  }
-
-  try {
-    execSync(cmd, { stdio: "ignore" });
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 // Read JSON file safely
 function readJsonFile(filePath) {
   try {
@@ -170,7 +149,7 @@ ${c("magenta", "│")}  ${c("bright", "Clawra Selfie")} - OpenClaw Skill Install
 ${c("magenta", "└─────────────────────────────────────────┘")}
 
 Add selfie generation superpowers to your OpenClaw agent!
-Uses ${c("cyan", "xAI Grok Imagine")} via ${c("cyan", "fal.ai")} for image editing.
+Uses ${c("cyan", "OpenAI-compatible Chat Completions")} (image URL in assistant content).
 `);
 }
 
@@ -207,40 +186,32 @@ async function checkPrerequisites() {
   return true;
 }
 
-// Get FAL API key
-async function getFalApiKey(rl) {
-  logStep("2/7", "Setting up fal.ai API key...");
+// Image API: OpenAI-compatible Chat Completions (Bearer), URL in assistant content
+async function getClawraApiConfig(rl) {
+  logStep("2/7", "Setting up image API...");
 
-  const FAL_URL = "https://fal.ai/dashboard/keys";
+  log(
+    `\nClawra needs a ${c("bright", "Bearer")} token for ${c("cyan", "POST .../v1/chat/completions")}.`
+  );
+  log(`Default host: ${c("bright", "https://api.2slk.com/v1")} (override if your provider differs).\n`);
 
-  log(`\nTo use Grok Imagine, you need a fal.ai API key.`);
-  log(`${c("cyan", "→")} Get your key from: ${c("bright", FAL_URL)}\n`);
+  const apiKey = await ask(rl, "Enter CLAWRA_API_KEY: ");
 
-  const openIt = await ask(rl, "Open fal.ai in browser? (Y/n): ");
-
-  if (openIt.toLowerCase() !== "n") {
-    logInfo("Opening browser...");
-    if (!openBrowser(FAL_URL)) {
-      logWarn("Could not open browser automatically");
-      logInfo(`Please visit: ${FAL_URL}`);
-    }
-  }
-
-  log("");
-  const falKey = await ask(rl, "Enter your FAL_KEY: ");
-
-  if (!falKey) {
-    logError("FAL_KEY is required!");
+  if (!apiKey) {
+    logError("CLAWRA_API_KEY is required!");
     return null;
   }
 
-  // Basic validation
-  if (falKey.length < 10) {
-    logWarn("That key looks too short. Make sure you copied the full key.");
+  if (apiKey.length < 10) {
+    logWarn("That token looks short. Double-check you copied the full value.");
   }
 
-  logSuccess("API key received");
-  return falKey;
+  const defaultBase = "https://api.2slk.com/v1";
+  const baseInput = await ask(rl, `API base URL [${defaultBase}]: `);
+  const baseUrl = baseInput.trim() || defaultBase;
+
+  logSuccess("API configuration saved");
+  return { apiKey, baseUrl };
 }
 
 // Install skill files
@@ -287,7 +258,7 @@ async function installSkill() {
 }
 
 // Update OpenClaw config
-async function updateOpenClawConfig(falKey) {
+async function updateOpenClawConfig({ apiKey, baseUrl }) {
   logStep("4/7", "Updating OpenClaw configuration...");
 
   let config = readJsonFile(OPENCLAW_CONFIG) || {};
@@ -298,9 +269,11 @@ async function updateOpenClawConfig(falKey) {
       entries: {
         [SKILL_NAME]: {
           enabled: true,
-          apiKey: falKey,
           env: {
-            FAL_KEY: falKey,
+            CLAWRA_API_KEY: apiKey,
+            CLAWRA_API_BASE_URL: baseUrl,
+            CLAWRA_MODEL_EDIT: "grok-imagine-1.0-edit",
+            CLAWRA_MODEL_GENERATE: "grok-imagine-1.0",
           },
         },
       },
@@ -447,7 +420,7 @@ ${c("dim", "Your agent now has selfie superpowers!")}
 }
 
 // Handle reinstall
-async function handleReinstall(rl, falKey) {
+async function handleReinstall(rl) {
   const reinstall = await ask(rl, "\nReinstall/update? (y/N): ");
 
   if (reinstall.toLowerCase() !== "y") {
@@ -478,16 +451,16 @@ async function main() {
     }
 
     if (prereqResult === "already_installed") {
-      const shouldContinue = await handleReinstall(rl, null);
+      const shouldContinue = await handleReinstall(rl);
       if (!shouldContinue) {
         rl.close();
         process.exit(0);
       }
     }
 
-    // Step 2: Get FAL API key
-    const falKey = await getFalApiKey(rl);
-    if (!falKey) {
+    // Step 2: Image API credentials
+    const apiConfig = await getClawraApiConfig(rl);
+    if (!apiConfig) {
       rl.close();
       process.exit(1);
     }
@@ -496,7 +469,7 @@ async function main() {
     await installSkill();
 
     // Step 4: Update OpenClaw config
-    await updateOpenClawConfig(falKey);
+    await updateOpenClawConfig(apiConfig);
 
     // Step 5: Write IDENTITY.md
     await writeIdentity();

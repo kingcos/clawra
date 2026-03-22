@@ -1,16 +1,21 @@
 /**
  * Grok Imagine to OpenClaw Integration
  *
- * Generates images using xAI's Grok Imagine model via fal.ai
- * and sends them to messaging channels via OpenClaw.
+ * Calls an OpenAI-compatible Chat Completions API that returns an image URL
+ * in the assistant message, then sends it via OpenClaw.
  *
  * Usage:
- *   npx ts-node grok-imagine-send.ts "<prompt>" "<channel>" ["<caption>"]
+ *   npx ts-node clawra-selfie.ts "<prompt>" "<channel>" ["<caption>"]
  *
- * Environment variables:
- *   FAL_KEY - Your fal.ai API key
- *   OPENCLAW_GATEWAY_URL - OpenClaw gateway URL (default: http://localhost:18789)
- *   OPENCLAW_GATEWAY_TOKEN - Gateway auth token (optional)
+ * Environment:
+ *   CLAWRA_API_KEY              — Bearer token (required)
+ *   CLAWRA_API_BASE_URL         — default https://api.2slk.com/v1
+ *   CLAWRA_MODEL_GENERATE       — default grok-imagine-1.0
+ *   CLAWRA_MODEL_EDIT           — default grok-imagine-1.0-edit
+ *   CLAWRA_TEMPERATURE          — default 0.7
+ *   CLAWRA_REFERENCE_IMAGE_URL    — optional override for edit reference image
+ *   OPENCLAW_GATEWAY_URL        — default http://localhost:18789
+ *   OPENCLAW_GATEWAY_TOKEN      — optional
  */
 
 import { exec } from "child_process";
@@ -18,146 +23,176 @@ import { promisify } from "util";
 
 const execAsync = promisify(exec);
 
-// Types
-interface GrokImagineInput {
-  prompt: string;
-  num_images?: number;
-  aspect_ratio?: AspectRatio;
-  output_format?: OutputFormat;
-}
+const DEFAULT_REFERENCE_IMAGE =
+  "https://cdn.jsdelivr.net/gh/SumeLabs/clawra@main/assets/clawra.png";
 
-interface GrokImagineImage {
-  url: string;
-  content_type: string;
-  file_name?: string;
-  width: number;
-  height: number;
-}
-
-interface GrokImagineResponse {
-  images: GrokImagineImage[];
-  revised_prompt?: string;
-}
-
-interface OpenClawMessage {
+export interface OpenClawMessage {
   action: "send";
   channel: string;
   message: string;
   media?: string;
 }
 
-type AspectRatio =
-  | "2:1"
-  | "20:9"
-  | "19.5:9"
-  | "16:9"
-  | "4:3"
-  | "3:2"
-  | "1:1"
-  | "2:3"
-  | "3:4"
-  | "9:16"
-  | "9:19.5"
-  | "9:20"
-  | "1:2";
+interface GenerateImageResult {
+  imageUrl: string;
+}
 
-type OutputFormat = "jpeg" | "png" | "webp";
+interface EditImageResult {
+  imageUrl: string;
+}
 
-interface GenerateAndSendOptions {
+export interface GenerateAndSendOptions {
   prompt: string;
   channel: string;
   caption?: string;
-  aspectRatio?: AspectRatio;
-  outputFormat?: OutputFormat;
   useClaudeCodeCLI?: boolean;
 }
 
-interface Result {
+export interface EditAndSendOptions {
+  prompt: string;
+  channel: string;
+  caption?: string;
+  referenceImageUrl?: string;
+  useClaudeCodeCLI?: boolean;
+}
+
+export interface Result {
   success: boolean;
   imageUrl: string;
   channel: string;
   prompt: string;
-  revisedPrompt?: string;
 }
 
-// Check for fal.ai client
-let falClient: any;
-try {
-  const { fal } = require("@fal-ai/client");
-  falClient = fal;
-} catch {
-  // Will use fetch instead
-  falClient = null;
+function getApiBaseUrl(): string {
+  const raw = process.env.CLAWRA_API_BASE_URL || "https://api.2slk.com/v1";
+  return raw.replace(/\/$/, "");
+}
+
+function requireApiKey(): string {
+  const key = process.env.CLAWRA_API_KEY;
+  if (!key) {
+    throw new Error(
+      "CLAWRA_API_KEY is not set. Set your provider Bearer token in the environment."
+    );
+  }
+  return key;
+}
+
+function getTemperature(): number {
+  const t = parseFloat(process.env.CLAWRA_TEMPERATURE || "0.7");
+  return Number.isFinite(t) ? t : 0.7;
 }
 
 /**
- * Generate image using Grok Imagine via fal.ai
+ * Parse image URL from assistant message content (plain URL or embedded in text).
  */
-async function generateImage(
-  input: GrokImagineInput
-): Promise<GrokImagineResponse> {
-  const falKey = process.env.FAL_KEY;
-
-  if (!falKey) {
-    throw new Error(
-      "FAL_KEY environment variable not set. Get your key from https://fal.ai/dashboard/keys"
-    );
+export function extractImageUrlFromContent(content: string): string {
+  const trimmed = content.trim();
+  const firstToken = trimmed.split(/\s+/)[0]?.replace(/[.,;:)]+$/, "") || "";
+  if (/^https?:\/\//i.test(firstToken)) {
+    return firstToken;
   }
-
-  // Use fal client if available
-  if (falClient) {
-    falClient.config({ credentials: falKey });
-
-    const result = await falClient.subscribe("xai/grok-imagine-image", {
-      input: {
-        prompt: input.prompt,
-        num_images: input.num_images || 1,
-        aspect_ratio: input.aspect_ratio || "1:1",
-        output_format: input.output_format || "jpeg",
-      },
-    });
-
-    return result.data as GrokImagineResponse;
+  const m = content.match(/https?:\/\/[^\s"'<>\])]+/i);
+  if (m) {
+    return m[0].replace(/[.,;:)]+$/, "");
   }
+  throw new Error("No image URL found in model response");
+}
 
-  // Fallback to fetch
-  const response = await fetch("https://fal.run/xai/grok-imagine-image", {
+async function chatCompletions(
+  model: string,
+  messages: Array<Record<string, unknown>>
+): Promise<string> {
+  const apiKey = requireApiKey();
+  const url = `${getApiBaseUrl()}/chat/completions`;
+  const response = await fetch(url, {
     method: "POST",
     headers: {
-      Authorization: `Key ${falKey}`,
       "Content-Type": "application/json",
+      Authorization: `Bearer ${apiKey}`,
     },
     body: JSON.stringify({
-      prompt: input.prompt,
-      num_images: input.num_images || 1,
-      aspect_ratio: input.aspect_ratio || "1:1",
-      output_format: input.output_format || "jpeg",
+      model,
+      messages,
+      temperature: getTemperature(),
     }),
   });
 
-  if (!response.ok) {
-    const error = await response.text();
-    throw new Error(`Image generation failed: ${error}`);
+  let data: Record<string, unknown> = {};
+  try {
+    data = (await response.json()) as Record<string, unknown>;
+  } catch {
+    // ignore
   }
 
-  return response.json();
+  if (!response.ok) {
+    const err = data.error as Record<string, unknown> | string | undefined;
+    const msg =
+      typeof err === "object" && err && "message" in err
+        ? String(err.message)
+        : typeof err === "string"
+          ? err
+          : JSON.stringify(data);
+    throw new Error(`Image API error (${response.status}): ${msg}`);
+  }
+
+  const choices = data.choices as Array<Record<string, unknown>> | undefined;
+  const message = choices?.[0]?.message as Record<string, unknown> | undefined;
+  const content = message?.content;
+
+  if (typeof content !== "string") {
+    throw new Error("Unexpected API response: missing choices[0].message.content");
+  }
+
+  return content;
+}
+
+/**
+ * Text-to-image: single user message with text prompt.
+ */
+export async function generateImage(input: {
+  prompt: string;
+}): Promise<GenerateImageResult> {
+  const model = process.env.CLAWRA_MODEL_GENERATE || "grok-imagine-1.0";
+  const content = await chatCompletions(model, [
+    { role: "user", content: input.prompt },
+  ]);
+  return { imageUrl: extractImageUrlFromContent(content) };
+}
+
+/**
+ * Edit reference image: multimodal user message (text + image_url).
+ */
+export async function editReferenceImage(input: {
+  prompt: string;
+  imageUrl: string;
+}): Promise<EditImageResult> {
+  const model = process.env.CLAWRA_MODEL_EDIT || "grok-imagine-1.0-edit";
+  const content = await chatCompletions(model, [
+    {
+      role: "user",
+      content: [
+        { type: "text", text: input.prompt },
+        { type: "image_url", image_url: { url: input.imageUrl } },
+      ],
+    },
+  ]);
+  return { imageUrl: extractImageUrlFromContent(content) };
 }
 
 /**
  * Send image via OpenClaw
  */
-async function sendViaOpenClaw(
+export async function sendViaOpenClaw(
   message: OpenClawMessage,
   useCLI: boolean = true
 ): Promise<void> {
   if (useCLI) {
-    // Use OpenClaw CLI
     const cmd = `openclaw message send --action send --channel "${message.channel}" --message "${message.message}" --media "${message.media}"`;
     await execAsync(cmd);
     return;
   }
 
-  // Direct API call
   const gatewayUrl =
     process.env.OPENCLAW_GATEWAY_URL || "http://localhost:18789";
   const gatewayToken = process.env.OPENCLAW_GATEWAY_TOKEN;
@@ -183,38 +218,24 @@ async function sendViaOpenClaw(
 }
 
 /**
- * Main function: Generate image and send to channel
+ * Generate image from text and send to channel.
  */
-async function generateAndSend(options: GenerateAndSendOptions): Promise<Result> {
+export async function generateAndSend(
+  options: GenerateAndSendOptions
+): Promise<Result> {
   const {
     prompt,
     channel,
     caption = "Generated with Grok Imagine",
-    aspectRatio = "1:1",
-    outputFormat = "jpeg",
     useClaudeCodeCLI = true,
   } = options;
 
-  console.log(`[INFO] Generating image with Grok Imagine...`);
+  console.log(`[INFO] Generating image via Chat Completions...`);
   console.log(`[INFO] Prompt: ${prompt}`);
-  console.log(`[INFO] Aspect ratio: ${aspectRatio}`);
 
-  // Generate image
-  const imageResult = await generateImage({
-    prompt,
-    num_images: 1,
-    aspect_ratio: aspectRatio,
-    output_format: outputFormat,
-  });
+  const { imageUrl } = await generateImage({ prompt });
+  console.log(`[INFO] Image URL: ${imageUrl}`);
 
-  const imageUrl = imageResult.images[0].url;
-  console.log(`[INFO] Image generated: ${imageUrl}`);
-
-  if (imageResult.revised_prompt) {
-    console.log(`[INFO] Revised prompt: ${imageResult.revised_prompt}`);
-  }
-
-  // Send via OpenClaw
   console.log(`[INFO] Sending to channel: ${channel}`);
 
   await sendViaOpenClaw(
@@ -234,44 +255,93 @@ async function generateAndSend(options: GenerateAndSendOptions): Promise<Result>
     imageUrl,
     channel,
     prompt,
-    revisedPrompt: imageResult.revised_prompt,
   };
 }
 
-// CLI entry point
+/**
+ * Edit reference selfie and send to channel (primary skill flow).
+ */
+export async function editAndSend(
+  options: EditAndSendOptions
+): Promise<Result> {
+  const {
+    prompt,
+    channel,
+    caption = "Edited with Grok Imagine",
+    referenceImageUrl = process.env.CLAWRA_REFERENCE_IMAGE_URL ||
+      DEFAULT_REFERENCE_IMAGE,
+    useClaudeCodeCLI = true,
+  } = options;
+
+  console.log(`[INFO] Editing reference image via Chat Completions...`);
+  console.log(`[INFO] Prompt: ${prompt}`);
+
+  const { imageUrl } = await editReferenceImage({
+    prompt,
+    imageUrl: referenceImageUrl,
+  });
+  console.log(`[INFO] Image URL: ${imageUrl}`);
+
+  console.log(`[INFO] Sending to channel: ${channel}`);
+
+  await sendViaOpenClaw(
+    {
+      action: "send",
+      channel,
+      message: caption,
+      media: imageUrl,
+    },
+    useClaudeCodeCLI
+  );
+
+  console.log(`[INFO] Done! Image sent to ${channel}`);
+
+  return {
+    success: true,
+    imageUrl,
+    channel,
+    prompt,
+  };
+}
+
 async function main() {
   const args = process.argv.slice(2);
 
   if (args.length < 2) {
     console.log(`
-Usage: npx ts-node grok-imagine-send.ts <prompt> <channel> [caption] [aspect_ratio] [output_format]
+Usage: npx ts-node clawra-selfie.ts <prompt> <channel> [caption]
 
 Arguments:
-  prompt        - Image description (required)
-  channel       - Target channel (required) e.g., #general, @user
-  caption       - Message caption (default: 'Generated with Grok Imagine')
-  aspect_ratio  - Image ratio (default: 1:1) Options: 2:1, 16:9, 4:3, 1:1, 3:4, 9:16
-  output_format - Image format (default: jpeg) Options: jpeg, png, webp
+  prompt   - Image description or edit instruction (required)
+  channel  - Target channel (required), e.g. #general, @user
+  caption  - Message caption (default: 'Generated with Grok Imagine')
+
+Modes:
+  CLAWRA_SELFIE_MODE=generate  — text-to-image (default)
+  CLAWRA_SELFIE_MODE=edit      — edit CLAWRA_REFERENCE_IMAGE_URL / default reference
 
 Environment:
-  FAL_KEY       - Your fal.ai API key (required)
+  CLAWRA_API_KEY           — Bearer token (required)
+  CLAWRA_API_BASE_URL      — default https://api.2slk.com/v1
+  CLAWRA_MODEL_GENERATE    — default grok-imagine-1.0
+  CLAWRA_MODEL_EDIT        — default grok-imagine-1.0-edit
+  CLAWRA_TEMPERATURE       — default 0.7
+  CLAWRA_REFERENCE_IMAGE_URL — optional (edit mode)
 
 Example:
-  FAL_KEY=your_key npx ts-node grok-imagine-send.ts "A cyberpunk city" "#art" "Check this out!"
+  CLAWRA_API_KEY=sk-... npx ts-node clawra-selfie.ts "A cyberpunk city" "#art" "Check this out!"
 `);
     process.exit(1);
   }
 
-  const [prompt, channel, caption, aspectRatio, outputFormat] = args;
+  const [prompt, channel, caption] = args;
+  const mode = (process.env.CLAWRA_SELFIE_MODE || "generate").toLowerCase();
 
   try {
-    const result = await generateAndSend({
-      prompt,
-      channel,
-      caption,
-      aspectRatio: aspectRatio as AspectRatio,
-      outputFormat: outputFormat as OutputFormat,
-    });
+    const result =
+      mode === "edit"
+        ? await editAndSend({ prompt, channel, caption })
+        : await generateAndSend({ prompt, channel, caption });
 
     console.log("\n--- Result ---");
     console.log(JSON.stringify(result, null, 2));
@@ -281,19 +351,6 @@ Example:
   }
 }
 
-// Export for module use
-export {
-  generateImage,
-  sendViaOpenClaw,
-  generateAndSend,
-  GrokImagineInput,
-  GrokImagineResponse,
-  OpenClawMessage,
-  GenerateAndSendOptions,
-  Result,
-};
-
-// Run if executed directly
 if (require.main === module) {
   main();
 }
